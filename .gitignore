@@ -1,0 +1,5 @@
+
+# Environment files
+cre-workflow/.env
+ai-worker/.env
+web/.env.local
