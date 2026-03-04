@@ -1,5 +1,5 @@
 import { createPublicClient, http, parseAbiItem, formatEther, formatGwei, type Block, type Transaction } from 'viem';
-import { baseSepolia } from 'viem/chains';
+import { baseSepolia, base, mainnet, arbitrum, polygon } from 'viem/chains';
 import { GoogleGenAI } from '@google/genai';
 import { createAgentWallet } from '@veridex/agentic-payments';
 import express from 'express';
@@ -8,15 +8,36 @@ import * as dotenv from 'dotenv';
 dotenv.config();
 
 // ── Configuration ────────────────────────────────────
-const RPC_URL = process.env.RPC_URL || 'https://sepolia.base.org';
-const TARGET_POOL = process.env.TARGET_POOL || '0x0000000000000000000000000000000000000000';
+let RPC_URL = process.env.RPC_URL || 'https://sepolia.base.org';
+let TARGET_POOL = process.env.TARGET_POOL || '0x0000000000000000000000000000000000000000';
 const CRE_WORKFLOW_URL = process.env.CRE_WORKFLOW_URL || 'http://localhost:3000/api/trigger';
 const WEB_BASE_URL = CRE_WORKFLOW_URL.replace('/api/trigger', '');
-const CHECK_INTERVAL_MS = 12_000; // ~6 Base Sepolia blocks
+// ── Mutable runtime config (updated via POST /api/tuning from dashboard) ──
+const tuning = {
+  demoFrequencyBlocks: 10,
+  demoFlashLoanEth: 50_000,
+  threatThreshold: 0.8,
+  aiTemperature: 0.1,
+  scanIntervalMs: 12_000,
+  highValueThresholdEth: 0.01,
+};
+
+let CHECK_INTERVAL_MS = tuning.scanIntervalMs;
+
+const CHAIN_MAPPINGS: Record<string, { chain: any; rpc: string }> = {
+  "Base Sepolia": { chain: baseSepolia, rpc: 'https://sepolia.base.org' },
+  "Base Mainnet": { chain: base, rpc: 'https://mainnet.base.org' },
+  "Ethereum Mainnet": { chain: mainnet, rpc: 'https://eth.llamarpc.com' },
+  "Arbitrum One": { chain: arbitrum, rpc: 'https://arb1.arbitrum.io/rpc' },
+  "Polygon": { chain: polygon, rpc: 'https://polygon-rpc.com' },
+};
+
+let activeChainName = "Base Sepolia";
+let activeChain = baseSepolia;
 
 // ── Blockchain Client ────────────────────────────────
-const publicClient = createPublicClient({
-  chain: baseSepolia,
+let publicClient = createPublicClient({
+  chain: activeChain,
   transport: http(RPC_URL),
 });
 
@@ -150,6 +171,39 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
+// ── POST /api/tuning — Live-update worker parameters from dashboard ──
+app.post('/api/tuning', (req, res) => {
+  const { demoFrequencyBlocks, demoFlashLoanEth, threatThreshold, aiTemperature, scanIntervalMs, highValueThresholdEth, targetPool, targetChain } = req.body;
+  if (demoFrequencyBlocks !== undefined) tuning.demoFrequencyBlocks = Number(demoFrequencyBlocks);
+  if (demoFlashLoanEth !== undefined) tuning.demoFlashLoanEth = Number(demoFlashLoanEth);
+  if (threatThreshold !== undefined) tuning.threatThreshold = Number(threatThreshold);
+  if (aiTemperature !== undefined) tuning.aiTemperature = Number(aiTemperature);
+  if (scanIntervalMs !== undefined) tuning.scanIntervalMs = Number(scanIntervalMs);
+  if (highValueThresholdEth !== undefined) tuning.highValueThresholdEth = Number(highValueThresholdEth);
+  if (targetPool && typeof targetPool === 'string' && targetPool.startsWith('0x')) {
+    TARGET_POOL = targetPool;
+    console.log('[Auvra Worker] Target Pool updated to:', TARGET_POOL);
+  }
+  if (targetChain && CHAIN_MAPPINGS[targetChain] && activeChainName !== targetChain) {
+    const mapping = CHAIN_MAPPINGS[targetChain];
+    activeChainName = targetChain;
+    activeChain = mapping.chain;
+    RPC_URL = mapping.rpc;
+    publicClient = createPublicClient({
+      chain: activeChain,
+      transport: http(RPC_URL),
+    });
+    console.log(`[Auvra Worker] Target Chain updated to: ${targetChain} (${RPC_URL})`);
+  }
+  console.log('[Auvra Worker] Tuning updated:', tuning);
+  res.json({ success: true, tuning, targetPool: TARGET_POOL, targetChain: activeChainName });
+});
+
+// ── GET /api/tuning — Current tuning for the dashboard ──
+app.get('/api/tuning', (_req, res) => {
+  res.json(tuning);
+});
+
 // ── GET /api/status — Full status for the dashboard ──
 app.get('/api/status', (_req, res) => {
   res.json({
@@ -160,6 +214,7 @@ app.get('/api/status', (_req, res) => {
     blocksScanned,
     threatsDetected,
     latestBlockStats,
+    tuning,
   });
 });
 
@@ -178,14 +233,27 @@ app.listen(4000, () => {
  * running at the web app's /api/trigger endpoint.
  */
 async function monitorProtocol() {
-  console.log('[Auvra Worker] Initializing Protocol Stream monitoring on Base Sepolia…');
+  console.log(`[Auvra Worker] Initializing Protocol Stream monitoring on ${activeChainName}…`);
   console.log('[Auvra Worker] Target Pool:', TARGET_POOL);
-  await pushEvent('info', `Monitoring started for ${TARGET_POOL} on Base Sepolia.`);
+  await pushEvent('info', `Monitoring started for ${TARGET_POOL} on ${activeChainName}.`);
 
+  let currentChainId = activeChain.id;
   let lastCheckedBlock = await publicClient.getBlockNumber();
 
   setInterval(async () => {
     try {
+      if (currentChainId !== activeChain.id) {
+        currentChainId = activeChain.id;
+        try {
+          lastCheckedBlock = await publicClient.getBlockNumber();
+          console.log(`[Auvra Worker] Resyncing block tracking to NEW chain (${activeChainName}) starting at block ${lastCheckedBlock}`);
+          pushEvent('info', `Stream tracking re-synced to ${activeChainName} at block ${lastCheckedBlock}`);
+        } catch (e) {
+          console.error(`[Auvra Worker] Failed to fetch block number after chain change:`, e);
+        }
+        return;
+      }
+
       const currentBlock = await publicClient.getBlockNumber();
       if (currentBlock <= lastCheckedBlock) return;
 
@@ -250,8 +318,8 @@ async function monitorProtocol() {
 
           const valueEth = Number(formatEther(value));
 
-          // High-value tx (> 0.01 ETH — meaningful on testnet)
-          if (valueEth > 0.01) {
+          // High-value tx (threshold configurable from dashboard)
+          if (valueEth > tuning.highValueThresholdEth) {
             highValueTxs.push({
               hash: tx.hash,
               from: tx.from,
@@ -332,24 +400,25 @@ async function monitorProtocol() {
         : currentVolume || 0.0001;
       const spikePercent = baseline > 0 ? (currentVolume / baseline) * 100 : 0;
 
-      // ── Demo injection — overlay on real data every ~30 s ───────
-      const isDemoExploit = currentBlock % 10n === 0n;
+      // ── Demo injection — frequency & amount configurable from dashboard ──
+      const isDemoExploit = tuning.demoFrequencyBlocks > 0 && currentBlock % BigInt(tuning.demoFrequencyBlocks) === 0n;
       if (isDemoExploit) {
         console.log('[Auvra Worker] Injecting demo Flash Loan signature…');
         const demoHash = `0xdead${currentBlock.toString(16).padStart(56, '0').slice(0, 56)}`;
+        const demoAmount = tuning.demoFlashLoanEth.toFixed(6);
         highValueTxs.unshift({
           hash: demoHash,
           from: '0xA1B2c3D4e5F60718293a4B5c6D7e8F9012345678',
           to: TARGET_POOL,
-          valueEth: '50000.000000',
+          valueEth: demoAmount,
           gasUsed: '3000000',
         });
         suspiciousTxs.unshift({
           hash: demoHash,
-          reason: `Flash loan: 50,000 ETH single-block spike in #${currentBlock} — atomic borrow→exploit→repay pattern`,
+          reason: `Flash loan: ${tuning.demoFlashLoanEth.toLocaleString()} ETH single-block spike in #${currentBlock} — atomic borrow→exploit→repay pattern`,
           from: '0xA1B2c3D4e5F60718293a4B5c6D7e8F9012345678',
           to: TARGET_POOL,
-          valueEth: '50000.000000',
+          valueEth: demoAmount,
         });
         await pushEvent('warning', `⚠ Flash Loan sig block #${currentBlock} — tx ${demoHash.slice(0, 18)}…`);
       }
@@ -392,15 +461,15 @@ async function monitorProtocol() {
         `── High-Value Transactions (${highValueTxs.length}) ──`,
         highValueTxs.length > 0
           ? highValueTxs.slice(0, 10).map(t =>
-              `  tx_hash=${t.hash}  from=${t.from}  to=${t.to}  value=${t.valueEth}ETH  gas=${t.gasUsed}`,
-            ).join('\n')
+            `  tx_hash=${t.hash}  from=${t.from}  to=${t.to}  value=${t.valueEth}ETH  gas=${t.gasUsed}`,
+          ).join('\n')
           : '  (none)',
         '',
         `── Suspicious Transactions (${suspiciousTxs.length}) ──`,
         suspiciousTxs.length > 0
           ? suspiciousTxs.slice(0, 10).map(t =>
-              `  tx_hash=${t.hash}  reason="${t.reason}"  from=${t.from}  to=${t.to}  value=${t.valueEth}ETH`,
-            ).join('\n')
+            `  tx_hash=${t.hash}  reason="${t.reason}"  from=${t.from}  to=${t.to}  value=${t.valueEth}ETH`,
+          ).join('\n')
           : '  (none)',
         '',
         `── Full Transaction Log (sample of ${allTxSummaries.length}/${totalTxCount}) ──`,
@@ -419,7 +488,7 @@ async function monitorProtocol() {
           config: {
             systemInstruction: SYSTEM_PROMPT,
             responseMimeType: 'application/json',
-            temperature: 0.1,
+            temperature: tuning.aiTemperature,
           },
         });
         const resultStr = response.text || '{}';
@@ -435,12 +504,12 @@ async function monitorProtocol() {
           console.warn('[Auvra Worker] Gemini unavailable — using deterministic fallback.');
           threatOutcome = isDemoExploit
             ? {
-                threatLevel: 0.95,
-                reasoning: `Deterministic fallback: Flash loan signature detected in block #${currentBlock}. ` +
-                  (suspiciousTxs[0]?.hash ? `Flagged tx: ${suspiciousTxs[0].hash}` : ''),
-                action: 'pause()',
-                confidence: 0.9,
-              }
+              threatLevel: 0.95,
+              reasoning: `Deterministic fallback: Flash loan signature detected in block #${currentBlock}. ` +
+                (suspiciousTxs[0]?.hash ? `Flagged tx: ${suspiciousTxs[0].hash}` : ''),
+              action: 'pause()',
+              confidence: 0.9,
+            }
             : { threatLevel: 0.1, reasoning: 'Normal operations. No anomalous patterns.', action: 'none', confidence: 0.8 };
         } else {
           throw err;
@@ -476,7 +545,7 @@ async function monitorProtocol() {
 
       // Push AI analysis to dashboard event log
       const lvl = threatOutcome.threatLevel;
-      const evtType = lvl >= 0.8 ? 'warning' : 'info';
+      const evtType = lvl >= tuning.threatThreshold ? 'warning' : 'info';
       await pushEvent(
         evtType,
         `AI Analysis (${blockRangeStr}): threat=${lvl.toFixed(2)}, txs=${totalTxCount}, actors=${uniqueActors.size}` +
@@ -484,10 +553,10 @@ async function monitorProtocol() {
         ` — ${threatOutcome.reasoning.slice(0, 120)}`,
       );
 
-      if (threatOutcome.threatLevel >= 0.8) threatsDetected++;
+      if (threatOutcome.threatLevel >= tuning.threatThreshold) threatsDetected++;
 
       // ── 5. If critical, trigger the CRE workflow via x402 ──────
-      if (threatOutcome.threatLevel >= 0.8 && threatOutcome.action === 'pause()') {
+      if (threatOutcome.threatLevel >= tuning.threatThreshold && threatOutcome.action === 'pause()') {
         console.log('[Auvra Worker] CRITICAL THREAT. Triggering CRE safeguard…');
         await pushEvent('warning', `CRITICAL threat (${threatOutcome.threatLevel.toFixed(2)}). Triggering CRE Workflow…`);
 

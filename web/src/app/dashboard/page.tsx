@@ -369,7 +369,7 @@ export default function Dashboard() {
                                 {currentState === 'detecting' && <div className="absolute inset-0 bg-red-500/5 animate-pulse" />}
                                 <div className="flex flex-col z-10">
                                     <span className="text-sm text-slate-400 font-medium">Target Protocol</span>
-                                    <span className="text-lg font-mono">Aave V3 (Base)</span>
+                                    <span className="text-lg font-mono">{session.settings.targetProtocol} (Base)</span>
                                 </div>
                                 <Activity className={`w-8 h-8 z-10 ${currentState === 'secured' ? 'text-emerald-500' : 'text-cyan-500 animate-pulse'}`} />
                                 <div className="flex flex-col text-right z-10">

@@ -29,6 +29,14 @@ export interface AuvraSettings {
     agentSpendLimitUsdc: number;
     targetProtocol: string;
     targetChain: string;
+    customTargetAddress: string;
+    // Demo tuning (pushed to AI worker at runtime)
+    demoFrequencyBlocks: number;
+    demoFlashLoanEth: number;
+    threatThreshold: number;
+    aiTemperature: number;
+    scanIntervalMs: number;
+    highValueThresholdEth: number;
 }
 
 export interface SessionState {
@@ -65,15 +73,22 @@ const DEFAULT_SETTINGS: AuvraSettings = {
     aiWorkerUrl:
         typeof window !== "undefined"
             ? localStorage.getItem("auvra_ai_worker_url") ||
-              process.env.NEXT_PUBLIC_AI_WORKER_URL ||
-              "http://localhost:4000"
+            process.env.NEXT_PUBLIC_AI_WORKER_URL ||
+            "http://localhost:4000"
             : "http://localhost:4000",
     sessionTimeoutMinutes: 30,
     autoTrigger: false,
     notificationsEnabled: true,
     agentSpendLimitUsdc: 1.0,
-    targetProtocol: "Aave V3",
+    targetProtocol: "Chainlink CCIP",
     targetChain: "Base Sepolia",
+    customTargetAddress: "",
+    demoFrequencyBlocks: 10,
+    demoFlashLoanEth: 50000,
+    threatThreshold: 0.8,
+    aiTemperature: 0.1,
+    scanIntervalMs: 12000,
+    highValueThresholdEth: 0.01,
 };
 
 const STORAGE_SESSION = "auvra_session";
