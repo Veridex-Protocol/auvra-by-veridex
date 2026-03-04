@@ -1,0 +1,18 @@
+{
+  "name": "auvra-cre-workflow",
+  "version": "1.0.0",
+  "description": "Chainlink CRE Workflow for Auvra AI",
+  "main": "src/handler.ts",
+  "scripts": {
+    "build": "bunx cre-compile src/handler.ts",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@chainlink/cre-sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.1",
+    "@types/node": "^20.0.0"
+  }
+}

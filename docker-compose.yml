@@ -1,0 +1,66 @@
+services:
+  # ─── Next.js Frontend ──────────────────────────────
+  web:
+    image: oven/bun:latest
+    container_name: auvra-web
+    working_dir: /app/hackathon/chainlink-convergence/web
+    ports:
+      - "3000:3000"
+    volumes:
+      - /Users/mannyuncharted/Documents/gigs/veridex:/app
+    environment:
+      - NODE_ENV=development
+      - NEXT_TELEMETRY_DISABLED=1
+    env_file:
+      - ./web/.env.local
+    command: >
+      sh -c "bun install --frozen-lockfile 2>/dev/null || bun install && bun run dev --hostname 0.0.0.0"
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e 'await fetch(\"http://localhost:3000\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - auvra-net
+
+  # ─── AI Worker (Gemini + On-Chain Monitor) ─────────
+  ai-worker:
+    image: oven/bun:latest
+    container_name: auvra-ai-worker
+    working_dir: /app/hackathon/chainlink-convergence/ai-worker
+    ports:
+      - "4000:4000"
+    volumes:
+      - /Users/mannyuncharted/Documents/gigs/veridex:/app
+    env_file:
+      - ./ai-worker/.env
+    environment:
+      - NODE_ENV=development
+      - CRE_WORKFLOW_URL=http://auvra-web:3000/api/trigger
+    command: >
+      sh -c "bun install --frozen-lockfile 2>/dev/null || bun install && bun run start"
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: on-failure
+    networks:
+      - auvra-net
+
+  # ─── CRE Workflow (Build & Output WASM) ────────────
+  cre-workflow:
+    image: oven/bun:latest
+    container_name: auvra-cre-workflow
+    working_dir: /app/hackathon/chainlink-convergence/cre-workflow
+    volumes:
+      - /Users/mannyuncharted/Documents/gigs/veridex:/app
+    env_file:
+      - ./cre-workflow/.env
+    command: >
+      sh -c "bun install --frozen-lockfile 2>/dev/null || bun install && bunx cre-setup && bun run build && echo '✅ CRE Workflow WASM compiled successfully' && ls -la src/handler.wasm"
+    networks:
+      - auvra-net
+
+networks:
+  auvra-net:
+    driver: bridge
