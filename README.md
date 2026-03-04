@@ -1,4 +1,4 @@
-# Auvra AI — Enterprise Risk Firewall for DeFi
+# Auvra — Enterprise Risk Firewall for DeFi
 
 **Privacy-preserving AI risk agents that safeguard DeFi protocols via Chainlink CRE, World ID, Tenderly, and thirdweb.**
 
@@ -25,6 +25,7 @@
 ## Problem
 
 DeFi protocols face a trilemma during live exploits:
+
 1. **Manual intervention is too slow** — by the time a multi-sig approves an emergency pause, funds are already drained.
 2. **Autonomous AI intervention is dangerous** — giving an AI unrestricted signing rights exposes the protocol to hallucination risk.
 3. **On-chain parameters are MEV-exploitable** — putting risk-detection thresholds on-chain lets searchers front-run or game the safeguards.
@@ -45,28 +46,28 @@ When the AI Risk Agent detects an exploit (e.g., flash loan attack, oracle manip
 ## Architecture
 
 ```
-┌──────────────────────┐    x402 payment    ┌──────────────────────────────┐
-│  Auvra AI Sentinel   │ ──────────────────▶ │  Chainlink CRE Workflow      │
+┌──────────────────────┐    x402 payment     ┌───────────────────────────────┐
+│  Auvra    Sentinel   │ ──────────────────▶ │  Chainlink CRE Workflow       │
 │  (ai-worker/)        │                     │  (cre-workflow/src/handler.ts)│
 │  • Gemini heuristics │                     │  • Confidential Compute       │
 │  • On-chain monitor  │                     │  • HTTPClient → Tenderly sim  │
 │  • @veridex/agent-sdk│                     │  • EVMClient → pause()        │
-└──────────────────────┘                     └─────────┬────────────────────┘
+└──────────────────────┘                     └─────────┬─────────────────────┘
                                                        │
                                                        ▼
-                              ┌──────────────────────────────────────┐
+                              ┌───────────────────────────────────────┐
                               │  Tenderly Virtual TestNet             │
                               │  • Simulates pause() on Base Sepolia  │
                               │  • Verifies no state corruption       │
-                              └──────────────────────────────────────┘
+                              └───────────────────────────────────────┘
                                                        │
                                                        ▼
-                              ┌──────────────────────────────────────┐
+                              ┌───────────────────────────────────────┐
                               │  thirdweb Admin Frontend (web/)       │
                               │  • Passkey auth (inAppWallet)         │
                               │  • World ID biometric verification    │
                               │  • Real-time threat dashboard         │
-                              └──────────────────────────────────────┘
+                              └───────────────────────────────────────┘
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Mermaid sequence diagram.
@@ -76,22 +77,26 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Mermaid sequence diagram.
 ## User Flow
 
 ### 1. Autonomous Agent Phase
+
 1. The **AI Risk Agent** (`ai-worker/`) monitors Base Sepolia for anomalous token flows.
 2. On-chain transfer events are aggregated into timeslices and fed to the **Gemini 2.5 Flash** heuristic model.
 3. When a critical threat is identified (≥ 0.8), the agent uses its **Auvra `@veridex/agentic-payments` SDK** session key to sign an x402 micropayment and triggers the CRE workflow.
 
 ### 2. CRE Orchestration Phase
+
 1. The CRE Workflow receives the threat payload via `http.Trigger`.
 2. It runs the AI's risk assessment through **Confidential Compute** to prevent MEV front-running.
 3. It calls the **Tenderly Simulation API** via `HTTPClient` to simulate `pause()` on a Virtual TestNet fork.
 4. If the simulation succeeds, the workflow suspends and alerts the protocol admin.
 
 ### 3. Human-in-the-Loop Phase
+
 1. The admin authenticates with a **thirdweb Passkey** on the dashboard.
 2. To approve the emergency pause, the admin verifies identity with **World ID** (biometric ZKP).
 3. The proof is validated off-chain within the CRE workflow.
 
 ### 4. Execution Phase
+
 1. The CRE `EVMClient` executes `pause()` on the target DeFi contract.
 2. The protocol is secured. Transaction finalized on-chain.
 
@@ -102,7 +107,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Mermaid sequence diagram.
 > **All files that use Chainlink CRE:**
 
 | File | Chainlink Feature | Description |
-|------|-------------------|-------------|
+|---|---|---|
 | [`cre-workflow/src/handler.ts`](cre-workflow/src/handler.ts) | `cre.handler`, `HTTPCapability`, `HTTPClient`, `Runner`, `consensusIdenticalAggregation` | Core CRE Workflow — HTTP trigger, Tenderly simulation via `HTTPClient`, workflow runner |
 | [`ai-worker/index.ts`](ai-worker/index.ts) | CRE Workflow trigger via x402 | AI agent triggers the CRE workflow endpoint with x402-authenticated requests |
 | [`web/src/app/api/trigger/route.ts`](web/src/app/api/trigger/route.ts) | CRE Workflow proxy | Processes threat payloads, runs Tenderly simulation (mirrors CRE handler logic for local dev) |
@@ -130,15 +135,15 @@ export async function main() {
 
 ## Tech Stack
 
-| Component | Technology | Purpose |
-|-----------|-----------|---------|
-| CRE Workflow | `@chainlink/cre-sdk` (TypeScript) | Decentralised orchestration layer |
-| AI Heuristics | Google Gemini 2.5 Flash | Real-time risk analysis |
-| Simulation | Tenderly Virtual TestNets API | Fork simulation of emergency actions |
-| Identity | World ID (IDKit v4) | Biometric Proof of Humanness |
-| Agent Payments | `@veridex/agentic-payments` | x402 payment protocol + session keys |
-| Dashboard | Next.js 16 + thirdweb SDK | Passkey auth + admin approval UI |
-| Blockchain | Base Sepolia (viem) | Target DeFi protocol monitoring |
+| Component      | Technology                          | Purpose                              |
+| -------------- | ----------------------------------- | ------------------------------------ |
+| CRE Workflow   | `@chainlink/cre-sdk` (TypeScript) | Decentralised orchestration layer    |
+| AI Heuristics  | Google Gemini 2.5 Flash             | Real-time risk analysis              |
+| Simulation     | Tenderly Virtual TestNets API       | Fork simulation of emergency actions |
+| Identity       | World ID (IDKit v4)                 | Biometric Proof of Humanness         |
+| Agent Payments | `@veridex/agentic-payments`       | x402 payment protocol + session keys |
+| Dashboard      | Next.js 16 + thirdweb SDK           | Passkey auth + admin approval UI     |
+| Blockchain     | Base Sepolia (viem)                 | Target DeFi protocol monitoring      |
 
 ---
 
@@ -196,6 +201,7 @@ docker compose up --build
 ```
 
 This starts:
+
 - **web** on `http://localhost:3000` (Next.js dashboard)
 - **ai-worker** on `http://localhost:4000` (AI monitoring agent)
 - **cre-workflow** (compiles the CRE WASM bundle)
@@ -215,11 +221,11 @@ cd cre-workflow && bun install && bun run build
 
 ### Environment Variables
 
-| Service | File | Key Variables |
-|---------|------|---------------|
-| ai-worker | `ai-worker/.env` | `GEMINI_API_KEY`, `RPC_URL`, `TARGET_POOL`, `CRE_WORKFLOW_URL` |
-| web | `web/.env.local` | `NEXT_PUBLIC_THIRDWEB_CLIENT_ID`, `TENDERLY_ACCESS_KEY`, `NEXT_PUBLIC_WORLDCOIN_APP_ID` |
-| cre-workflow | `cre-workflow/.env` | `TENDERLY_ACCESS_KEY`, `TENDERLY_ACCOUNT_SLUG` |
+| Service      | File                  | Key Variables                                                                                 |
+| ------------ | --------------------- | --------------------------------------------------------------------------------------------- |
+| ai-worker    | `ai-worker/.env`    | `GEMINI_API_KEY`, `RPC_URL`, `TARGET_POOL`, `CRE_WORKFLOW_URL`                        |
+| web          | `web/.env.local`    | `NEXT_PUBLIC_THIRDWEB_CLIENT_ID`, `TENDERLY_ACCESS_KEY`, `NEXT_PUBLIC_WORLDCOIN_APP_ID` |
+| cre-workflow | `cre-workflow/.env` | `TENDERLY_ACCESS_KEY`, `TENDERLY_ACCOUNT_SLUG`                                            |
 
 ---
 
@@ -241,6 +247,7 @@ cre simulate src/handler.wasm \
 ```
 
 The simulation demonstrates:
+
 1. HTTP trigger accepting the AI threat payload
 2. Tenderly Virtual TestNet simulation of `pause()`
 3. Consensus aggregation across DON nodes
@@ -251,31 +258,37 @@ The simulation demonstrates:
 ## Hackathon Tracks
 
 ### 1. CRE & AI ($17K / $10.5K / $6.5K)
+
 - AI agent (Gemini 2.5 Flash) consumes CRE workflows via x402 payments
 - Full CRE Workflow in [`cre-workflow/src/handler.ts`](cre-workflow/src/handler.ts)
 - Agent triggers CRE via [`ai-worker/index.ts`](ai-worker/index.ts)
 
 ### 2. Risk & Compliance ($16K / $10K / $6K)
+
 - Real-time DeFi pool monitoring with automated emergency pause triggers
 - Risk heuristics evaluate flash loans, oracle manipulation, reentrancy patterns
 - Tenderly simulation prevents false-positive damage
 
 ### 3. Privacy ($16K / $10K / $6K)
+
 - CRE Confidential HTTP keeps AI risk parameters off-chain
 - MEV bots cannot reverse-engineer detection thresholds
 - Sensitive heuristic data never touches the mempool
 
 ### 4. World ID — Best Use with CRE ($5K)
+
 - World ID biometric verification gates emergency `pause()` execution
 - Prevents AI hallucination risk by requiring human compliance
 - Integrated via IDKit in [`web/src/app/dashboard/page.tsx`](web/src/app/dashboard/page.tsx)
 
 ### 5. Tenderly — Virtual TestNets ($5K / $2.5K / $1.75K / $750)
+
 - Real Tenderly Simulation API integration in [`web/src/app/api/trigger/route.ts`](web/src/app/api/trigger/route.ts)
 - CRE Workflow simulates `pause()` on Base Sepolia fork before execution
 - Tenderly config in [`cre-workflow/src/handler.ts`](cre-workflow/src/handler.ts)
 
 ### 6. thirdweb x CRE
+
 - thirdweb `inAppWallet` with Passkey authentication
 - `ConnectButton` + `useActiveAccount` in [`web/src/app/dashboard/page.tsx`](web/src/app/dashboard/page.tsx)
 - thirdweb Provider in [`web/src/app/components/Providers.tsx`](web/src/app/components/Providers.tsx)
@@ -284,17 +297,17 @@ The simulation demonstrates:
 
 ## Links
 
-| Resource | URL |
-|----------|-----|
-| Source Code | [GitHub Repository](https://github.com/Veridex-Protocol/veridex) |
-| Demo Video | *[YouTube — 3-5 min demo]* |
-| Tenderly Explorer | *[Tenderly Virtual TestNet Explorer Link]* |
-| CRE Workflow | [`cre-workflow/src/handler.ts`](cre-workflow/src/handler.ts) |
-| AI Worker | [`ai-worker/index.ts`](ai-worker/index.ts) |
-| Admin Dashboard | [`web/src/app/dashboard/page.tsx`](web/src/app/dashboard/page.tsx) |
+| Resource          | URL                                                               |
+| ----------------- | ----------------------------------------------------------------- |
+| Source Code       | [GitHub Repository](https://github.com/Veridex-Protocol/veridex)     |
+| Demo Video        | *[YouTube — 3-5 min demo]*                                     |
+| Tenderly Explorer | *[Tenderly Virtual TestNet Explorer Link]*                      |
+| CRE Workflow      | [`cre-workflow/src/handler.ts`](cre-workflow/src/handler.ts)       |
+| AI Worker         | [`ai-worker/index.ts`](ai-worker/index.ts)                         |
+| Admin Dashboard   | [`web/src/app/dashboard/page.tsx`](web/src/app/dashboard/page.tsx) |
 
 ---
 
 ## License
 
-MIT — see [LICENSE](../../LICENSE)
+MIT — see [LICENSE](LICENSE)
