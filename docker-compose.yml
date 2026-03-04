@@ -14,7 +14,14 @@ services:
     env_file:
       - ./web/.env.local
     command: >
-      sh -c "bun install --frozen-lockfile 2>/dev/null || bun install && bun run dev --hostname 0.0.0.0"
+      sh -c "
+        bun install --frozen-lockfile 2>/dev/null || bun install;
+        rm -rf node_modules/@veridex/sdk;
+        mkdir -p node_modules/@veridex/sdk;
+        cp -R /app/packages/sdk/dist node_modules/@veridex/sdk/dist;
+        cp /app/packages/sdk/package.json node_modules/@veridex/sdk/package.json;
+        bun run dev --hostname 0.0.0.0
+      "
     healthcheck:
       test: ["CMD-SHELL", "bun -e 'await fetch(\"http://localhost:3000\")' || exit 1"]
       interval: 15s
@@ -39,7 +46,14 @@ services:
       - NODE_ENV=development
       - CRE_WORKFLOW_URL=http://auvra-web:3000/api/trigger
     command: >
-      sh -c "bun install --frozen-lockfile 2>/dev/null || bun install && bun run start"
+      sh -c "
+        bun install --frozen-lockfile 2>/dev/null || bun install;
+        rm -rf node_modules/@veridex/agentic-payments;
+        mkdir -p node_modules/@veridex/agentic-payments;
+        cp -R /app/packages/agent-sdk/dist node_modules/@veridex/agentic-payments/dist;
+        cp /app/packages/agent-sdk/package.json node_modules/@veridex/agentic-payments/package.json;
+        bun run start
+      "
     depends_on:
       web:
         condition: service_healthy

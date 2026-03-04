@@ -1,5 +1,6 @@
 import { ThirdwebProvider } from "thirdweb/react";
 import { createThirdwebClient } from "thirdweb";
+import { SessionProvider } from "./SessionContext";
 
 // Normally you would feed this from .env
 const client = createThirdwebClient({
@@ -9,7 +10,9 @@ const client = createThirdwebClient({
 export default function Providers({ children }: { children: React.ReactNode }) {
     return (
         <ThirdwebProvider>
-            {children}
+            <SessionProvider>
+                {children}
+            </SessionProvider>
         </ThirdwebProvider>
     );
 }

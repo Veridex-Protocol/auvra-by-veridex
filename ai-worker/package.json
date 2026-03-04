@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@google/genai": "^1.43.0",
-    "@veridex/agentic-payments": "../../../packages/agent-sdk",
+    "@veridex/agentic-payments": "2.0.2",
     "@veridex/sdk": "../../../packages/sdk",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",

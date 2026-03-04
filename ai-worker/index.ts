@@ -1,4 +1,4 @@
-import { createPublicClient, http, parseAbiItem, formatEther } from 'viem';
+import { createPublicClient, http, parseAbiItem, formatEther, formatGwei, type Block, type Transaction } from 'viem';
 import { baseSepolia } from 'viem/chains';
 import { GoogleGenAI } from '@google/genai';
 import { createAgentWallet } from '@veridex/agentic-payments';
@@ -67,6 +67,32 @@ app.use(express.json());
 let isMonitoring = false;
 let agentWallet: any = null;
 
+// ── Latest block analysis state (exposed via /api/status) ──
+let latestBlockStats: {
+  blockRange: string;
+  blockNumbers: string[];
+  totalTxCount: number;
+  totalValueEth: string;
+  totalGasUsed: string;
+  avgGasPrice: string;
+  uniqueActors: number;
+  contractCalls: number;
+  highValueTxs: { hash: string; from: string; to: string; valueEth: string; gasUsed: string }[];
+  suspiciousTxs: { hash: string; reason: string; from: string; to: string; valueEth: string }[];
+  erc20Transfers: number;
+  erc20Volume: string;
+  spikePercent: number;
+  threatLevel: number;
+  aiReasoning: string;
+  timestamp: number;
+} | null = null;
+let blocksScanned = 0;
+let threatsDetected = 0;
+
+// Rolling baseline for volume spike detection (last 50 windows)
+const volumeHistory: number[] = [];
+const MAX_HISTORY = 50;
+
 /**
  * Push a workflow event to the web store (non-blocking, fire-and-forget).
  */
@@ -119,13 +145,21 @@ app.post('/api/config', async (req, res) => {
   }
 });
 
-// ── GET /api/status — Health check for the dashboard ─
+// ── GET /health — Simple liveness probe (for settings "Test" button) ──
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
+});
+
+// ── GET /api/status — Full status for the dashboard ──
 app.get('/api/status', (_req, res) => {
   res.json({
     monitoring: isMonitoring,
     walletActive: !!agentWallet,
     targetPool: TARGET_POOL,
     rpc: RPC_URL,
+    blocksScanned,
+    threatsDetected,
+    latestBlockStats,
   });
 });
 
@@ -136,7 +170,8 @@ app.listen(4000, () => {
 
 
 /**
- * Core monitoring loop — pulls on-chain data and feeds it to the AI heuristics.
+ * Core monitoring loop — pulls REAL on-chain block & transaction data and
+ * feeds it (incl. tx hashes) to the AI heuristics.
  *
  * When a threat is detected above the 0.8 threshold, the agent uses its
  * session key (via agentWallet.fetch / x402) to trigger the CRE workflow
@@ -149,70 +184,238 @@ async function monitorProtocol() {
 
   let lastCheckedBlock = await publicClient.getBlockNumber();
 
-  const baselineData = {
-    avgVolumePerBlock: 50n * 10n ** 18n, // 50 tokens
-    tvl: 1_000_000n * 10n ** 18n,        // 1 M tokens
-  };
-
   setInterval(async () => {
     try {
       const currentBlock = await publicClient.getBlockNumber();
       if (currentBlock <= lastCheckedBlock) return;
 
-      console.log('[Auvra Worker] Processing blocks', lastCheckedBlock + 1n, 'to', currentBlock);
+      const fromBlock = lastCheckedBlock + 1n;
+      console.log(`[Auvra Worker] Processing blocks ${fromBlock}n to ${currentBlock}n`);
 
-      // 1. Gather on-chain transfer events
-      const logs = await publicClient.getLogs({
-        address: TARGET_POOL as `0x${string}`,
-        event: transferEventAbi,
-        fromBlock: lastCheckedBlock + 1n,
-        toBlock: currentBlock,
-      });
+      // ── 1. Fetch real blocks with full transaction data ──────────
+      const blockNumbers: string[] = [];
+      let totalTxCount = 0;
+      let totalValueWei = 0n;
+      let totalGasUsed = 0n;
+      let totalGasPrice = 0n;
+      let gasPriceCount = 0;
+      let contractCallCount = 0;
+      const uniqueActors = new Set<string>();
+      const highValueTxs: { hash: string; from: string; to: string; valueEth: string; gasUsed: string }[] = [];
+      const suspiciousTxs: { hash: string; reason: string; from: string; to: string; valueEth: string }[] = [];
+      const allTxSummaries: string[] = [];
+
+      // Fetch every block in the range (typically ~6 blocks per 12 s cycle)
+      const blockFetches: Promise<any>[] = [];
+      for (let b = fromBlock; b <= currentBlock; b++) {
+        blockFetches.push(
+          publicClient.getBlock({ blockNumber: b, includeTransactions: true }).catch(() => null),
+        );
+      }
+      const blocks = (await Promise.all(blockFetches)).filter(Boolean);
 
       lastCheckedBlock = currentBlock;
+      blocksScanned++;
 
-      let totalVolume = 0n;
-      const uniqueActors = new Set<string>();
+      for (const block of blocks) {
+        blockNumbers.push(block.number!.toString());
+        totalGasUsed += block.gasUsed ?? 0n;
 
-      logs.forEach(log => {
-        if (log.args.value) totalVolume += log.args.value;
-        if (log.args.from) uniqueActors.add(log.args.from);
-        if (log.args.to) uniqueActors.add(log.args.to);
-      });
+        for (const tx of (block.transactions as any[])) {
+          totalTxCount++;
+          const value: bigint = tx.value ?? 0n;
+          totalValueWei += value;
+          uniqueActors.add(tx.from);
+          if (tx.to) uniqueActors.add(tx.to);
 
-      // For live demo: inject a synthetic flash-loan signature every ~30 s
-      // so the demo video shows a full detection cycle within the time limit.
+          if (tx.gasPrice) {
+            totalGasPrice += tx.gasPrice;
+            gasPriceCount++;
+          }
+
+          // Contract call — has calldata beyond bare 0x
+          const isContractCall = tx.input && tx.input.length > 2;
+          if (isContractCall) contractCallCount++;
+
+          // Contract creation (to == null)
+          if (!tx.to) {
+            suspiciousTxs.push({
+              hash: tx.hash,
+              reason: `Contract creation in block #${block.number}`,
+              from: tx.from,
+              to: 'CONTRACT_CREATE',
+              valueEth: formatEther(value),
+            });
+          }
+
+          const valueEth = Number(formatEther(value));
+
+          // High-value tx (> 0.01 ETH — meaningful on testnet)
+          if (valueEth > 0.01) {
+            highValueTxs.push({
+              hash: tx.hash,
+              from: tx.from,
+              to: tx.to || 'CONTRACT_CREATE',
+              valueEth: valueEth.toFixed(6),
+              gasUsed: tx.gas?.toString() || '0',
+            });
+          }
+
+          // Complex contract interaction — high gas limit
+          if (tx.gas && tx.gas > 500_000n && !suspiciousTxs.find(s => s.hash === tx.hash)) {
+            suspiciousTxs.push({
+              hash: tx.hash,
+              reason: `High gas limit ${tx.gas.toString()} — complex interaction in block #${block.number}`,
+              from: tx.from,
+              to: tx.to || 'CONTRACT_CREATE',
+              valueEth: formatEther(value),
+            });
+          }
+
+          // Large contract calldata (> 1 KB) – potential exploit payload
+          if (isContractCall && tx.input.length > 2048 && !suspiciousTxs.find(s => s.hash === tx.hash)) {
+            suspiciousTxs.push({
+              hash: tx.hash,
+              reason: `Large calldata (${(tx.input.length / 2).toLocaleString()} bytes) — potential exploit payload`,
+              from: tx.from,
+              to: tx.to || 'CONTRACT_CREATE',
+              valueEth: formatEther(value),
+            });
+          }
+
+          // Transaction summary for AI prompt (cap at 25)
+          if (allTxSummaries.length < 25) {
+            allTxSummaries.push(
+              `  tx_hash=${tx.hash} block=#${block.number} from=${tx.from} to=${tx.to || 'CREATE'} value=${formatEther(value)}ETH gas=${tx.gas?.toString() || '?'} input_bytes=${tx.input ? (tx.input.length - 2) / 2 : 0}`,
+            );
+          }
+        }
+      }
+
+      const totalValueEth = formatEther(totalValueWei);
+      const avgGasPrice = gasPriceCount > 0
+        ? formatGwei(totalGasPrice / BigInt(gasPriceCount))
+        : '0';
+      const blockRangeStr = fromBlock === currentBlock
+        ? `#${currentBlock}`
+        : `#${fromBlock}–#${currentBlock}`;
+
+      // ── Push block scan summary ─────────────────────────────────
+      await pushEvent(
+        'info',
+        `Block ${blockRangeStr} — ${totalTxCount} txs, ${uniqueActors.size} actors, ` +
+        `${Number(totalValueEth).toFixed(4)} ETH, ${contractCallCount} contract calls` +
+        (highValueTxs.length ? `, ${highValueTxs.length} high-value` : '') +
+        (suspiciousTxs.length ? `, ${suspiciousTxs.length} suspicious` : ''),
+      );
+
+      // ── Log real tx hashes to stdout ────────────────────────────
+      if (highValueTxs.length > 0) {
+        console.log(`[Auvra Worker] High-value txs (${highValueTxs.length}):`);
+        highValueTxs.slice(0, 5).forEach(t =>
+          console.log(`  ${t.hash}  ${t.from.slice(0, 10)}…→${t.to.slice(0, 10)}…  ${t.valueEth} ETH`),
+        );
+      }
+      if (suspiciousTxs.length > 0) {
+        console.log(`[Auvra Worker] Suspicious txs (${suspiciousTxs.length}):`);
+        suspiciousTxs.slice(0, 5).forEach(t =>
+          console.log(`  ${t.hash}  ${t.reason}`),
+        );
+      }
+
+      // ── Volume spike detection using rolling baseline ───────────
+      const currentVolume = Number(totalValueEth);
+      volumeHistory.push(currentVolume);
+      if (volumeHistory.length > MAX_HISTORY) volumeHistory.shift();
+      const baseline = volumeHistory.length > 1
+        ? volumeHistory.slice(0, -1).reduce((a, b) => a + b, 0) / (volumeHistory.length - 1)
+        : currentVolume || 0.0001;
+      const spikePercent = baseline > 0 ? (currentVolume / baseline) * 100 : 0;
+
+      // ── Demo injection — overlay on real data every ~30 s ───────
       const isDemoExploit = currentBlock % 10n === 0n;
       if (isDemoExploit) {
         console.log('[Auvra Worker] Injecting demo Flash Loan signature…');
-        totalVolume = baselineData.avgVolumePerBlock * 1000n; // 100 000% spike
-        uniqueActors.add('0xExploiterContract1234');
-        await pushEvent('warning', 'Anomaly detected in Pool: Flash Loan volume spike.');
+        const demoHash = `0xdead${currentBlock.toString(16).padStart(56, '0').slice(0, 56)}`;
+        highValueTxs.unshift({
+          hash: demoHash,
+          from: '0xA1B2c3D4e5F60718293a4B5c6D7e8F9012345678',
+          to: TARGET_POOL,
+          valueEth: '50000.000000',
+          gasUsed: '3000000',
+        });
+        suspiciousTxs.unshift({
+          hash: demoHash,
+          reason: `Flash loan: 50,000 ETH single-block spike in #${currentBlock} — atomic borrow→exploit→repay pattern`,
+          from: '0xA1B2c3D4e5F60718293a4B5c6D7e8F9012345678',
+          to: TARGET_POOL,
+          valueEth: '50000.000000',
+        });
+        await pushEvent('warning', `⚠ Flash Loan sig block #${currentBlock} — tx ${demoHash.slice(0, 18)}…`);
       }
 
-      if (totalVolume === 0n && !isDemoExploit) return; // quiet block
+      // ── Skip AI on empty blocks with no demo ────────────────────
+      if (totalTxCount === 0 && !isDemoExploit) {
+        latestBlockStats = {
+          blockRange: blockRangeStr,
+          blockNumbers,
+          totalTxCount: 0,
+          totalValueEth: '0',
+          totalGasUsed: totalGasUsed.toString(),
+          avgGasPrice,
+          uniqueActors: 0,
+          contractCalls: 0,
+          highValueTxs: [],
+          suspiciousTxs: [],
+          erc20Transfers: 0,
+          erc20Volume: '0',
+          spikePercent: 0,
+          threatLevel: 0,
+          aiReasoning: 'No transactions in block range.',
+          timestamp: Date.now(),
+        };
+        return; // quiet cycle
+      }
 
-      // 2. Format context for the heuristic model
-      const volumeStr = formatEther(totalVolume);
-      const baselineVolumeStr = formatEther(baselineData.avgVolumePerBlock);
-      const spikePercent = (Number(volumeStr) / Number(baselineVolumeStr)) * 100;
-
+      // ── 2. Build rich AI context with real tx hashes ────────────
       const aiContext = [
-        `Block Range: ${lastCheckedBlock} - ${currentBlock}`,
-        `Total Transfer Volume: ${volumeStr}`,
-        `Volume Spike: ${spikePercent.toFixed(2)}%`,
-        `Unique Actors in Window: ${uniqueActors.size}`,
+        `Block Range: ${fromBlock} – ${currentBlock}`,
+        `Blocks Analyzed: [${blockNumbers.join(', ')}]`,
+        `Total Transactions: ${totalTxCount}`,
+        `Total Value Transferred: ${totalValueEth} ETH`,
+        `Total Gas Used: ${totalGasUsed.toString()}`,
+        `Average Gas Price: ${avgGasPrice} Gwei`,
+        `Unique Actors: ${uniqueActors.size}`,
+        `Contract Calls: ${contractCallCount}`,
+        `Volume vs Baseline (${volumeHistory.length - 1}-window MA): ${spikePercent.toFixed(2)}%`,
+        '',
+        `── High-Value Transactions (${highValueTxs.length}) ──`,
+        highValueTxs.length > 0
+          ? highValueTxs.slice(0, 10).map(t =>
+              `  tx_hash=${t.hash}  from=${t.from}  to=${t.to}  value=${t.valueEth}ETH  gas=${t.gasUsed}`,
+            ).join('\n')
+          : '  (none)',
+        '',
+        `── Suspicious Transactions (${suspiciousTxs.length}) ──`,
+        suspiciousTxs.length > 0
+          ? suspiciousTxs.slice(0, 10).map(t =>
+              `  tx_hash=${t.hash}  reason="${t.reason}"  from=${t.from}  to=${t.to}  value=${t.valueEth}ETH`,
+            ).join('\n')
+          : '  (none)',
+        '',
+        `── Full Transaction Log (sample of ${allTxSummaries.length}/${totalTxCount}) ──`,
+        allTxSummaries.length > 0 ? allTxSummaries.join('\n') : '  (empty blocks)',
       ].join('\n');
 
       console.log('[Auvra Worker] Evaluated timeslice. Running AI risk heuristic…');
 
-      // 3. Query the heuristic model
-      let threatOutcome = { threatLevel: 0, reasoning: '', action: 'none' };
+      // ── 3. Query the heuristic model ────────────────────────────
+      let threatOutcome = { threatLevel: 0, reasoning: '', action: 'none', confidence: 0 };
 
       try {
         const response = await ai.models.generateContent({
           model: 'gemini-2.5-flash',
-          contents: `Analyze this on-chain timeslice:\n${aiContext}`,
+          contents: `Analyze this on-chain timeslice. ALWAYS reference specific tx_hash values from the data in your reasoning:\n${aiContext}`,
           config: {
             systemInstruction: SYSTEM_PROMPT,
             responseMimeType: 'application/json',
@@ -231,17 +434,59 @@ async function monitorProtocol() {
         if (isAuthError || !process.env.GEMINI_API_KEY) {
           console.warn('[Auvra Worker] Gemini unavailable — using deterministic fallback.');
           threatOutcome = isDemoExploit
-            ? { threatLevel: 0.95, reasoning: 'Deterministic: massive 100 000% volume spike indicative of flash loan.', action: 'pause()' }
-            : { threatLevel: 0.1, reasoning: 'Normal operations.', action: 'none' };
+            ? {
+                threatLevel: 0.95,
+                reasoning: `Deterministic fallback: Flash loan signature detected in block #${currentBlock}. ` +
+                  (suspiciousTxs[0]?.hash ? `Flagged tx: ${suspiciousTxs[0].hash}` : ''),
+                action: 'pause()',
+                confidence: 0.9,
+              }
+            : { threatLevel: 0.1, reasoning: 'Normal operations. No anomalous patterns.', action: 'none', confidence: 0.8 };
         } else {
           throw err;
         }
       }
 
-      console.log('[Auvra Worker] AI Analysis > Threat Level:', threatOutcome.threatLevel);
-      console.log('[Auvra Worker] AI Reasoning:', threatOutcome.reasoning);
+      console.log(`[Auvra Worker] AI Analysis > Threat Level: ${threatOutcome.threatLevel}`);
+      console.log(`[Auvra Worker] AI Reasoning: ${threatOutcome.reasoning}`);
+      if (suspiciousTxs.length > 0) {
+        console.log(`[Auvra Worker] Flagged tx_hashes:`);
+        suspiciousTxs.slice(0, 5).forEach(t => console.log(`  → ${t.hash}  (${t.reason.slice(0, 60)})`));
+      }
 
-      // 4. If critical, trigger the CRE workflow via x402
+      // ── 4. Update tracked stats (matches declared type) ────────
+      latestBlockStats = {
+        blockRange: blockRangeStr,
+        blockNumbers,
+        totalTxCount,
+        totalValueEth,
+        totalGasUsed: totalGasUsed.toString(),
+        avgGasPrice,
+        uniqueActors: uniqueActors.size,
+        contractCalls: contractCallCount,
+        highValueTxs: highValueTxs.slice(0, 10),
+        suspiciousTxs: suspiciousTxs.slice(0, 10),
+        erc20Transfers: 0,
+        erc20Volume: '0',
+        spikePercent,
+        threatLevel: threatOutcome.threatLevel,
+        aiReasoning: threatOutcome.reasoning,
+        timestamp: Date.now(),
+      };
+
+      // Push AI analysis to dashboard event log
+      const lvl = threatOutcome.threatLevel;
+      const evtType = lvl >= 0.8 ? 'warning' : 'info';
+      await pushEvent(
+        evtType,
+        `AI Analysis (${blockRangeStr}): threat=${lvl.toFixed(2)}, txs=${totalTxCount}, actors=${uniqueActors.size}` +
+        (suspiciousTxs.length ? ` — flagged: ${suspiciousTxs.map(t => t.hash.slice(0, 14) + '…').join(', ')}` : '') +
+        ` — ${threatOutcome.reasoning.slice(0, 120)}`,
+      );
+
+      if (threatOutcome.threatLevel >= 0.8) threatsDetected++;
+
+      // ── 5. If critical, trigger the CRE workflow via x402 ──────
       if (threatOutcome.threatLevel >= 0.8 && threatOutcome.action === 'pause()') {
         console.log('[Auvra Worker] CRITICAL THREAT. Triggering CRE safeguard…');
         await pushEvent('warning', `CRITICAL threat (${threatOutcome.threatLevel.toFixed(2)}). Triggering CRE Workflow…`);
@@ -251,6 +496,7 @@ async function monitorProtocol() {
           threatLevel: threatOutcome.threatLevel,
           action: threatOutcome.action,
           reasoning: threatOutcome.reasoning,
+          flaggedTxs: suspiciousTxs.slice(0, 5).map(t => ({ hash: t.hash, reason: t.reason })),
         };
 
         if (agentWallet) {
@@ -268,7 +514,6 @@ async function monitorProtocol() {
             await pushEvent('error', 'CRE Workflow trigger failed. Is the orchestrator online?');
           }
         } else {
-          // Fallback: trigger without x402 payment wrapping
           console.log('[Auvra Worker] Agent Wallet not active — triggering CRE directly…');
           try {
             const res = await fetch(CRE_WORKFLOW_URL, {
